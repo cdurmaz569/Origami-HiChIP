@@ -89,3 +89,5 @@ This will convert the interactions in the results file with their particular col
 * 1 -- Reports the PET count of each interaction
 * 2 -- Reportes the (uncorrected) hypergeometric p-value of the interaction (based on the Fullwood et al 2009 method)
 * 3 -- Reports the confidence/belief probability from the MCMC procedue
+  
+  ***Note: scripts were modified from work with Daniel Day during his postdoc in Rick Young's lab at Whitehead Institute. 
