@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+
+BASEDIR=$(dirname $0)
+SCRIPTDIR=$BASEDIR/../scripts
+
+PEAKCOUNTFILE=raw-counts.out
+INTCOUNTFILE=raw-interactions.out
+TMPBAMPREFIX=bam$RANDOM.prefix
+BURNIN=100
+ITERATIONS=10000
+PRUNE=5
+MERGEDIST=0
+SLOPDIST=0
+SLOPGENOME=null
+MINIMODEL=yes
+USEDISTANCE=yes
+ZSCOREFILTER=no
+ASSIGNTOPEAKS=no
+ONLYMAP=no
+MINDIST=0
+MAXDIST=0
+NOINTERCHROMOSOMAL=no
+USEDF=0
+USEGLM=no
+COUNTCAP=30
+DOWNSAMPLE=no
+
+
+helpmenu() {
+  if [ $# -eq 1 ];
+  then
+    echo $1
+  fi
+  
+  printf "origami-analysis [options] <mapped reads BAM> <peak BED file> <output prefix>\n"
+
+  (printf "%s\t%s\n" "-h" "help menu (this output)"
+  printf "%s\t%s\n" "--without-distance" "Turns off weighing interactions with a distance-driven weight"
+  printf "%s\t%s\n" "--iterations=[positive integer]" "Sets the number of iterations for running the MCMC estimation (default 10000)"
+  printf "%s\t%s\n" "--burn-in=[0 or positive integer]" "Sets the number of iterations to use as the burn-in period, separate from the --iterations (default 100, 0 means no burn-in period)"
+  printf "%s\t%s\n" "--prune=[0 or >=2]" "Sets the number of steps at which to take an iteration rather than prune it (default 5, 0 means no pruning)"
+  printf "%s\t%s\n" "--join-nearby-peaks=[positive integer]" "For peaks within N distance, merge them together"
+  printf "%s\t%s\n" "--slop-dist=[positive integer]" "Extends each peak by N base pairs on both ends (default none, requires --slop-genome)"
+  printf "%s\t%s\n" "--slop-genome=[file]" "Genome annotation file (default none, requires --slop-dist)"
+  printf "%s\t%s\n" "--save-full-model" "Saves all data points in the model (by default saves the mini model of key data points, WARNING this may generate a really big file)"
+  printf "%s\t%s\n" "--peak-count-filter=[zscore]" "Remove ChIP peaks with signal above the defined z-score (default no filtering)"
+  printf "%s\t%s\n" "--only-map-pets" "Only generate files relating to mapping PETs across peaks, does not run the statistical model"
+  printf "%s\t%s\n" "--assign-to-peaks" "When --slop-genome is used, re-maps the original peak onto the previous peak for display purposes (see manual for details)"
+  printf "%s\t%s\n" "--min-dist=[positive integer]" "Minimum intrachromsomal distance required between peaks (default consider all interactions)"
+  printf "%s\t%s\n" "--max-dist=[positive integer]" "Maximum intrachromsomal distance required between peaks (default consider all interactions)"
+  printf "%s\t%s\n" "--no-interchromosomal" "Do not consider any interchromsomal interactions"
+  printf "%s\t%s\n" "--count-cap=[count]" ""
+  printf "%s\t%s\n" "--downsample=[number of PETs]" "Run analysis on downsampled BAM file to a specified number of PETs, must be non-negative") | column -t -s $'\t'
+
+  printf "\n"
+  printf "Distance estimation (ignored when --without-distance is used)\n"
+  printf "There are two modes, smooth spline (default) and the Poisson GLM (experimental)\n"
+  printf "The smooth spline tends to converge faster, although it may over-estimate the confidence in an interaction\n"
+  printf "The Poisson GLM may explore the uncertainity of the data better, but it takes much longer to converge and tends to require fine tuning of the --iterations, --burn-in, and --prune options\n"
+  printf "\n"
+  printf "For the smooth spline mode (default):\n"
+  printf "%20s\t     %-50s\n" "--use-df=[positive number]" "Sets the effective degrees of freedom for the smooth spline calculation of distance"
+  printf "For the Poisson GLM mode (experimental)\n"
+  printf "%20s\t     %-50s\n" "--use-glm" "Uses the Poisson GLM to estimate the bias due to distance"
+
+}
+
+TEMP=`getopt -o h -l iterations:,burn-in:,prune:,slop-dist:,slop-genome:,save-full-model,without-distance,peak-count-filter:,use-df:,assign-to-peaks,only-map-pets,join-nearby-peaks:,min-dist:,max-dist:,no-interchromosomal,use-glm,count-cap:,downsample: -n 'origami' -- "$@"`
+
+
+eval set -- "$TEMP"
+
+while [ $# -ge 1 ]; do
+	case "$1" in
+		--)
+			shift
+			break
+			;;
+		-h)
+			helpmenu
+			exit 0
+			;;
+		--iterations)
+		  ITERATIONS="$2"
+		  shift
+		  ;;
+		--burn-in)
+		  BURNIN="$2"
+		  shift
+		  ;;
+		--prune)
+		  PRUNE="$2"
+		  shift
+		  ;;
+		--slop-dist)
+		  SLOPDIST="$2"
+		  shift
+		  ;;
+		--slop-genome)
+		  SLOPGENOME="$2"
+		  shift
+		  ;;
+		--save-full-model)
+		  MINIMODEL=no
+		  ;;
+		--without-distance)
+		  USEDISTANCE=no
+		  ;;
+		--peak-count-filter)
+		  ZSCOREFILTER="$2"
+		  shift
+		  ;;
+		--use-df)
+		  USEDF="$2"
+		  shift
+		  ;;
+		--assign-to-peaks)
+		  ASSIGNTOPEAKS=yes
+		  ;;
+		--only-map-pets)
+		  ONLYMAP=yes
+		  ;;
+		--join-nearby-peaks)
+		  MERGEDIST="$2"
+		  shift
+		  ;;
+		--min-dist)
+		  MINDIST="$2"
+		  shift
+		  ;;
+		--max-dist)
+		  MAXDIST="$2"
+		  shift
+		  ;;
+		--no-interchromosomal)
+		  NOINTERCHROMOSOMAL=yes
+		  ;;
+		--use-glm)
+		  USEGLM=yes
+		  ;;
+    --count-cap)
+      COUNTCAP="$2"
+      shift
+      ;;
+    --downsample)
+      DOWNSAMPLE="$2"
+      shift
+      if [ "$DOWNSAMPLE" -lt 1 ];
+      then
+        helpmenu "Error: Downsampling must be given a positive integer!"
+        exit 1
+      fi
+      ;;
+	esac
+	shift
+done
+
+if [ $# -lt 3 ];
+then
+  helpmenu "Error: did not supply necessary file name arguments"
+  exit 1
+fi
+
+
+READSFILE=$1
+INPUTFILE=$2
+PREFIX=$3
+
+if [ ! -e "$READSFILE" ];
+then
+  helpmenu "Error: cannot find BAM file $READSFILE"
+  exit 1
+fi
+
+if [ ! -e "$INPUTFILE" ];
+then
+  helpmenu "Error: cannot find peaks BED file $INPUTFILE"
+  exit 1
+fi
+
+BAMPREFIX=${READSFILE%.bam}
+TMPFILE=".$RANDOM.peaks.bed"
+SORTEDREADSFILE="$BAMPREFIX.sorted.bam"
+
+
+if ([ $SLOPDIST -eq 0 ] && [ $SLOPGENOME != "null" ]) || ([ $SLOPDIST -gt 0 ] && [ $SLOPGENOME = "null" ])
+then
+  helpmenu "Error: if specifying --slop-dist or --slop-genome, must specify the other"
+  exit 1
+fi
+
+if [ "$DOWNSAMPLE" != "no" ];
+then
+  echo "Downsampling BAM file"
+  TMPBAMFILE=".$RANDOM.downsample.bam"
+  OUTPUTBAMFILE="$PREFIX.downsample.bam"
+  OUTPUTSORTEDBAMFILE="$PREFIX.downsample.sorted.bam"
+  $SCRIPTDIR/downsample-bam-file.pl $READSFILE $DOWNSAMPLE $TMPBAMFILE
+  
+  if [ $? -ne 0 ];
+  then
+    echo "Error: failed to downsample BAM file, see error messages"
+    exit 1
+  fi
+  
+  samtools view -Sb $TMPBAMFILE > $OUTPUTBAMFILE
+  
+  if [ $? -ne 0 ];
+  then
+    echo "Error: could not generate downsampled BAM file, see error messages"
+    exit
+  fi
+
+  rm $TMPBAMFILE ## cleanup
+  
+  samtools sort -@8 -Ttmp $OUTPUTBAMFILE > $OUTPUTSORTEDBAMFILE
+  
+  if [ $? -ne 0 ];
+  then
+    echo "Error: failed to sort downsampled BAM file, see error messages"
+    exit 1
+  fi
+  
+  READSFILE=$OUTPUTBAMFILE
+  SORTEDREADSFILE=$OUTPUTSORTEDBAMFILE
+fi
+
+
+echo "Identifying PET counts in peaks and interactions..."
+
+
+$SCRIPTDIR/extract-sam-header.pl $SORTEDREADSFILE > names.txt
+cut -f 1-3 $INPUTFILE | bedtools sort -faidx names.txt > $TMPFILE
+
+if [ $MERGEDIST -gt 0 ];
+then
+  OUTFILE=$PREFIX.merge.bed
+  @BEDTOOLS@ merge -i $TMPFILE -d $MERGEDIST > $OUTFILE
+  cp $OUTFILE $TMPFILE
+fi
+
+if [ $SLOPDIST -gt 0 ];
+then
+  OUTFILE=$PREFIX.slop.bed
+  @BEDTOOLS@ slop -i $TMPFILE -g $SLOPGENOME -b $SLOPDIST | @BEDTOOLS@ merge > $OUTFILE
+  cp $OUTFILE $TMPFILE
+fi
+  
+
+if [ ! -e "$PREFIX-raw-counts.out" ];
+then
+  @BEDTOOLSCOVERAGE@
+  
+  if [ $? -ne 0 ];
+  then
+    echo "Error in getting the PET counts per anchor, see error messages"
+    exit 1
+  fi
+fi
+
+if [ $ZSCOREFILTER != "no" ];
+then
+  FILTERBEDTMP=$RANDOM.keeppeaks.bed
+  TRANSTMP=$RANDOM.trans.out
+  @RSCRIPTEXE@ $SCRIPTDIR/peaks-zscore.r $PREFIX-raw-counts.out $FILTERBEDTMP $ZSCOREFILTER
+  @BEDTOOLS@ intersect -wa -a $PREFIX-raw-counts.out -b $FILTERBEDTMP > $TRANSTMP
+  mv $TRANSTMP $PREFIX-raw-counts.out ## removed filtered counts
+  @BEDTOOLS@ intersect -wa -a $TMPFILE -b $FILTERBEDTMP > $TRANSTMP
+  mv $TRANSTMP $TMPFILE ## remove filtered peaks
+  rm $FILTERBEDTMP
+fi
+
+if [ ! -e "$PREFIX-raw-int-counts.txt" ];
+then
+  OUTFILE="$RANDOM.tmp.txt"
+  CARRYFILE="$RANDOM.tmp.txt"
+  @BEDTOOLS@ pairtobed -bedpe -type both -abam $READSFILE -b $TMPFILE > $PREFIX-raw-interactions.out
+
+  $SCRIPTDIR/estimate-counts.pl $PREFIX-raw-interactions.out > $OUTFILE
+  
+
+  if [ $MINDIST -gt 0 ];
+  then
+    awk 'function abs(value) { return (value<0?-value:value); } { if($1!=$4 || $3==$5 || abs($5-$3) >= '"$MINDIST"') print }' $OUTFILE > $CARRYFILE
+    mv $CARRYFILE $OUTFILE
+  fi
+  
+  if [ $MAXDIST -gt 0 ];
+  then
+    awk 'function abs(value) { return (value<0?-value:value); } { if($1!=$4 || $3==$5 || abs($5-$3) <= '"$MAXDIST"') print }' $OUTFILE > $CARRYFILE
+    mv $CARRYFILE $OUTFILE
+  fi
+  
+  if [ $NOINTERCHROMOSOMAL == "yes" ];
+  then
+    awk '{ if($1==$4) print }' $OUTFILE > $CARRYFILE
+    mv $CARRYFILE $OUTFILE
+  fi
+  
+  mv $OUTFILE $PREFIX-raw-int-counts.txt 
+fi
+
+rm $TMPFILE 
+
+echo "Estimating interaction belief..."
+
+if [ $ONLYMAP == "no" ];
+then
+  @RSCRIPTEXE@ $SCRIPTDIR/estimate-significance.r $PREFIX-raw-counts.out $PREFIX-raw-int-counts.txt $PREFIX-results.csv $PREFIX-model-data.Rdata $ITERATIONS $BURNIN $PRUNE $MINIMODEL $USEDISTANCE $USEDF $COUNTCAP
+  
+  if [ $? -ne 0 ];
+  then
+    echo "Error in estimating belief probabilities"
+    exit 1
+  fi
+
+fi
+
+if [ $ASSIGNTOPEAKS != "no" ] && [ $ONLYMAP == "no" ]
+then
+  ANCHORS=$RANDOM.anchors.bed
+  OVERLAP=$RANDOM.anchors.bed
+  $SCRIPTDIR/extract-anchors.pl $PREFIX-results.csv > $ANCHORS
+  @BEDTOOLS@ intersect -wao -a $ANCHORS -b $INPUTFILE > $OVERLAP
+  $SCRIPTDIR/reassign-anchors.pl $PREFIX-results.csv $OVERLAP > $PREFIX-results-peakassigned.csv
+  rm $ANCHORS $OVERLAP
+fi
+
+echo "Analysis completed"
+

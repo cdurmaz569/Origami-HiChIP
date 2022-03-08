@@ -1,0 +1,25 @@
+BAMLIBS = -lbamtools
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+bindir=@bindir@
+scriptdir=${prefix}/scripts
+
+all: bamexes
+
+bamexes:
+	cd src && g++ @CPPFLAGS@ -c mapped-reads-merge.cpp
+	cd src && g++ -o mapped-reads-merge mapped-reads-merge.o $(BAMLIBS)
+
+clean:
+	cd src && rm *.o mapped-reads-merge
+
+dist:
+	tar -cvf origami.tar configure.ac configure Makefile.in README.md LICENSE INSTALL bin/origami-conversion bin/origami-analysis.in bin/origami-alignment.in bin/origami-make-wig-profile bin/origami-merge-replicate-files scripts/* src/mapped-reads-merge.cpp
+	gzip origami.tar
+
+install:
+	mkdir ${prefix}
+	mkdir ${bindir}
+	cp bin/origami-alignment bin/origami-analysis bin/origami-conversion bin/origami-make-wig-profile bin/origami-merge-replicate-files ${bindir}
+	cp -r scripts ${prefix}
+	cp src/mapped-reads-merge ${bindir}
